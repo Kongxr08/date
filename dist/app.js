@@ -1,4 +1,4 @@
-import {categories,defaultSettings,uid,dayKey,dateAt,localInput,addDays,overlap,validEvent,validTask,validateBackup,parseSchedule,proposePlan} from './core.js';
+import {categories,defaultSettings,uid,dayKey,dateAt,localInput,addDays,startOfWeek,layoutWeek,overlap,validEvent,validTask,validateBackup,parseSchedule,proposePlan} from './core.js';
 const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const paths={calendar:'M4 5h16v16H4z M7 3v4 M17 3v4 M4 10h16 M8 14h1 M15 14h1 M8 17h1',scan:'M8 3H3v5 M16 3h5v5 M3 16v5h5 M21 16v5h-5 M7 9h10 M7 13h10 M7 17h5',plan:'M4 5h16v16H4z M8 9l1 1 2-3 M14 9h3 M8 16l1 1 2-3 M14 16h3',settings:'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8 M9 3h6l1 3 3 1 2 5-2 2v3l-5 3-2-1-3 1-5-3v-3l-2-2 2-5 3-1z',plus:'M12 5v14 M5 12h14',left:'M15 5l-7 7 7 7',right:'M9 5l7 7-7 7',close:'M6 6l12 12 M18 6L6 18',edit:'M4 16v4h4L20 8l-4-4z M13 7l4 4',trash:'M3 6h18 M8 6V3h8v3 M6 6l1 15h10l1-15 M10 10v7 M14 10v7',clock:'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M12 7v5l3 2',shield:'M12 3l8 3v6c0 5-8 9-8 9s-8-4-8-9V6z M8 12l3 3 5-6',upload:'M4 15v6h16v-6 M12 16V3 M7 8l5-5 5 5',download:'M4 15v6h16v-6 M12 3v13 M7 11l5 5 5-5',spark:'M12 3l2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5z',check:'M5 12l4 4L19 6',search:'M10 3a7 7 0 1 0 0 14 7 7 0 0 0 0-14 M15 15l6 6'};
@@ -9,11 +9,17 @@ let data=blank(), loadError='', rawBackup='';
 try { rawBackup=localStorage.getItem(KEY)||''; if(rawBackup) data=validateBackup(JSON.parse(rawBackup)); }
 catch { loadError='无法读取本机数据，已暂停写入。请先导出原始备份，再恢复有效备份。'; }
 let tab='calendar', selected=dayKey(new Date()), month=new Date(new Date().getFullYear(),new Date().getMonth(),1), filter='', drafts=[], ocrText='', referenceDay=selected, imageURL='', busy=false, proposals=[], planSnapshot='', planFrom=selected;
+let calendarMode='week',weekScroll={anchor:'',top:8*64,left:0};
+try { const saved=localStorage.getItem('timecanvas.calendarMode');if(['week','month'].includes(saved))calendarMode=saved; } catch {}
 const formatDate=(value,options={month:'long',day:'numeric',weekday:'long'})=>new Intl.DateTimeFormat('zh-CN',options).format(new Date(value));
 const time=value=>formatDate(value,{hour:'2-digit',minute:'2-digit',hour12:false});
 const eventRange=e=>`${formatDate(e.start,{month:'numeric',day:'numeric'})} ${time(e.start)}–${dayKey(e.start)===dayKey(e.end)?'':formatDate(e.end,{month:'numeric',day:'numeric'})+' '}${time(e.end)}`;
 let toastTimer;
-function toast(message) { $('#toast').textContent=message; $('#toast').classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>$('#toast').classList.remove('show'),4000); }
+function toast(message,undo=null) {
+  const node=$('#toast');node.textContent=message;node.classList.toggle('has-action',!!undo);
+  if(undo){const button=document.createElement('button');button.type='button';button.textContent='撤销';button.onclick=undo;node.append(button);}
+  node.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>node.classList.remove('show'),undo?8000:4000);
+}
 function commit(next) {
   if(loadError) { toast(loadError); return false; }
   try { validateBackup(next); localStorage.setItem(KEY,JSON.stringify(next)); data=next; return true; }
@@ -22,15 +28,43 @@ function commit(next) {
 function change(fn) { const next=structuredClone(data); fn(next); if(commit(next)) { render(); return true; } return false; }
 const nav=()=>[['calendar','calendar','日历'],['import','scan','图片导入'],['planner','plan','个人规划'],['settings','settings','设置']].map(([id,symbol,title])=>`<button data-tab="${id}" class="${tab===id?'active':''}" ${tab===id?'aria-current="page"':''}>${icon(symbol)}<span>${title}</span></button>`).join('');
 function render() {
+  const previousWeek=$('#week-scroll');
+  if(previousWeek)weekScroll={anchor:previousWeek.dataset.week,top:previousWeek.scrollTop,left:previousWeek.scrollLeft};
   const titles={calendar:['我的日历','留一点时间，给自己。'],import:['图片导入','把图片里的安排，放进你的日历。'],planner:['个人规划','让重要的事，都有自己的时间。'],settings:['使用与设置','按你的节奏，安排每一天。']};
   $('#app').innerHTML=`<div class="shell"><aside class="sidebar"><div class="brand"><div class="brand-mark">${icon('calendar')}</div><div>时序<small>TIME CANVAS</small></div></div><nav class="nav" aria-label="主导航">${nav()}</nav><div class="sidebar-foot"><span class="status-dot"></span>你的时间，由你安排<p>日程保存在此设备<br>图片在浏览器中识别</p></div></aside><main class="main"><header class="topbar"><div><div class="eyebrow">YOUR TIME, YOUR PACE</div><h1>${titles[tab][0]}</h1><p class="date-label">${titles[tab][1]}</p></div>${tab==='calendar'?`<button class="btn primary" data-action="new-event">${icon('plus')}新建日程</button>`:tab==='planner'?`<button class="btn primary" data-action="new-task">${icon('plus')}添加任务</button>`:''}</header>${loadError?`<div class="load-error" role="alert">${esc(loadError)}</div>`:''}<section id="content">${tab==='calendar'?calendarView():tab==='import'?importView():tab==='planner'?plannerView():settingsView()}</section></main><nav class="bottom-nav" aria-label="底部导航">${nav()}</nav></div>`;
   bind();
+  const week=$('#week-scroll');
+  if(week){
+    const earliest=layoutWeek(data.events,selected).flatMap(d=>d.segments).reduce((minute,s)=>Math.min(minute,s.startMinute),8*60);
+    week.scrollTop=weekScroll.anchor===week.dataset.week?weekScroll.top:Math.max(0,Math.floor(earliest/60)-1)*64;
+    week.scrollLeft=weekScroll.anchor===week.dataset.week?weekScroll.left:0;
+  }
 }
 function eventCard(e, showDate=false) {
   const conflict=data.events.some(other=>other.id!==e.id&&overlap(e,other));
   return `<article class="event-card ${esc(e.category)}"><div class="event-time">${time(e.start)}<small>${dayKey(e.start)!==dayKey(e.end)?'次日 ':''}${time(e.end)}</small></div><div class="event-body"><button class="event-title" data-edit-event="${esc(e.id)}">${esc(e.title)}</button><p class="subtle">${showDate?formatDate(e.start,{month:'numeric',day:'numeric'})+' · ':''}${categories[e.category]}${e.taskId?' · 已规划':''}</p>${conflict?'<span class="badge warn">时间重叠</span>':''}</div><button class="tiny-btn" aria-label="编辑 ${esc(e.title)}" data-edit-event="${esc(e.id)}">${icon('edit')}</button></article>`;
 }
 function calendarView() {
+  return `<div class="view-toolbar"><div class="view-switch" role="group" aria-label="日历视图"><button data-calendar-mode="week" aria-pressed="${calendarMode==='week'}" class="${calendarMode==='week'?'active':''}">周课表</button><button data-calendar-mode="month" aria-pressed="${calendarMode==='month'}" class="${calendarMode==='month'?'active':''}">月历</button></div><p class="subtle">${calendarMode==='week'?'点空白时间添加课程，点课程修改或删除':'选择日期查看当天安排'}</p></div>${calendarMode==='week'?weekView():monthView()}`;
+}
+function weekView(){
+  const days=layoutWeek(data.events,selected),first=days[0].date,last=days[6].date,today=dayKey(new Date());
+  const weekEvents=[...new Map(days.flatMap(d=>d.segments.map(s=>[s.event.id,s.event]))).values()];
+  const dayEvents=days.find(d=>d.day===selected)?.segments.map(s=>s.event)||[];
+  const headers=days.map((d,i)=>`<button class="week-day-heading ${d.day===today?'is-today':''} ${d.day===selected?'is-selected':''}" data-day="${d.day}" aria-label="选择${formatDate(d.date)}" aria-pressed="${d.day===selected}"><strong>周${['一','二','三','四','五','六','日'][i]}</strong><span>${formatDate(d.date,{month:'numeric',day:'numeric'})}</span></button>`).join('');
+  const columns=days.map(d=>{
+    const slots=Array.from({length:48},(_,i)=>{const minute=i*30,hour=String(Math.floor(minute/60)).padStart(2,'0'),clock=`${hour}:${minute%60?'30':'00'}`;return `<button class="week-slot" data-slot-day="${d.day}" data-slot-minute="${minute}" aria-label="添加${formatDate(d.date)} ${clock}课程"></button>`;}).join('');
+    const blocks=d.segments.map(s=>{
+      const e=s.event,top=s.startMinute/60*64,height=(s.endMinute-s.startMinute)/60*64;
+      const label=`${e.title}，${formatDate(d.date)}，${time(s.start)}至${s.endMinute===1440?'24:00':time(s.end)}，点击编辑或删除`;
+      return `<button class="week-event ${esc(e.category)} ${height<37?'compact':''}" data-edit-event="${esc(e.id)}" style="top:${top}px;height:${Math.max(16,height)}px;left:calc(${s.lane/s.laneCount*100}% + 3px);width:calc(${100/s.laneCount}% - 6px)" aria-label="${esc(label)}" title="${esc(label)}"><strong>${esc(e.title)}</strong><span>${time(s.start)}–${s.endMinute===1440?'24:00':time(s.end)}</span>${s.continuesBefore||s.continuesAfter?'<small>跨日课程</small>':''}</button>`;
+    }).join('');
+    return `<div class="week-day-column ${d.day===today?'is-today':''}" data-column-day="${d.day}">${slots}${blocks}</div>`;
+  }).join('');
+  const hourLabels=Array.from({length:25},(_,h)=>`<span class="week-hour-label" style="top:${h*64}px">${String(h).padStart(2,'0')}:00</span>`).join('');
+  return `<section class="panel week-panel"><div class="week-top"><div><div class="eyebrow">WEEKLY TIMETABLE</div><h2>${formatDate(first,{year:'numeric',month:'numeric',day:'numeric'})}–${formatDate(last,{month:'numeric',day:'numeric'})}</h2><p class="subtle">本周 ${weekEvents.length} 项日程 · 时间范围 00:00–24:00</p></div><div class="month-controls"><button class="btn ghost" data-action="today">本周</button><button class="icon-btn" data-week="-1" aria-label="上一周">${icon('left')}</button><button class="icon-btn" data-week="1" aria-label="下一周">${icon('right')}</button></div></div><label class="week-date-picker">跳转日期<input type="date" id="week-date" value="${selected}"></label><div class="week-scroll" id="week-scroll" data-week="${dayKey(first)}" tabindex="0" role="region" aria-label="周课表，横向滑动查看七天，纵向滑动查看一天的时间"><div class="week-canvas"><div class="week-heading-row"><div class="week-corner">时间</div>${headers}</div><div class="week-body"><div class="week-time-axis">${hourLabels}</div>${columns}</div></div></div><div class="week-bottom"><div class="legend">${Object.entries(categories).map(([key,label])=>`<span><i class="dot ${key}"></i>${label}</span>`).join('')}</div><p class="hint">手机上可左右滑动查看七天，上下滑动查看 24 小时。重叠课程会并排显示。</p></div></section><section class="panel week-agenda"><div class="panel-head"><div><h2>${formatDate(dateAt(selected),{month:'long',day:'numeric',weekday:'long'})}</h2><p class="subtle">${dayEvents.length} 项日程 · 点课程修改时间或删除</p></div><button class="btn primary" data-action="new-event">${icon('plus')}添加课程</button></div>${dayEvents.length?dayEvents.map(e=>eventCard(e)).join(''):'<p class="hint">这一天还没有课程，在课表中点一个空白时间段即可添加。</p>'}</section>`;
+}
+function monthView() {
   const first=new Date(month); const offset=(first.getDay()+6)%7; const start=addDays(first,-offset);
   const dayEvents=data.events.filter(e=>+new Date(e.start)<+addDays(dateAt(selected),1)&&+new Date(e.end)>+dateAt(selected)).sort((a,b)=>+new Date(a.start)-+new Date(b.start));
   const monthEvents=data.events.filter(e=>new Date(e.start).getMonth()===month.getMonth()&&new Date(e.start).getFullYear()===month.getFullYear());
@@ -57,6 +91,10 @@ function settingsView() {
 }
 const categoryOptions=selected=>Object.entries(categories).map(([key,label])=>`<option value="${key}" ${key===selected?'selected':''}>${label}</option>`).join('');
 function bind() {
+  document.querySelectorAll('[data-calendar-mode]').forEach(button=>button.onclick=()=>{calendarMode=button.dataset.calendarMode;try{localStorage.setItem('timecanvas.calendarMode',calendarMode);}catch{}render();});
+  document.querySelectorAll('button[data-week]').forEach(button=>button.onclick=()=>{selected=dayKey(addDays(dateAt(selected),Number(button.dataset.week)*7));const d=dateAt(selected);month=new Date(d.getFullYear(),d.getMonth(),1);render();});
+  document.querySelectorAll('[data-slot-day]').forEach(button=>button.onclick=()=>{selected=button.dataset.slotDay;const start=dateAt(selected);start.setMinutes(Number(button.dataset.slotMinute));render();editEvent(undefined,{start:start.toISOString(),end:new Date(+start+3600000).toISOString()});});
+  if($('#week-date'))$('#week-date').onchange=e=>{if(!e.target.value)return;selected=e.target.value;const d=dateAt(selected);month=new Date(d.getFullYear(),d.getMonth(),1);render();};
   document.querySelectorAll('[data-tab]').forEach(button=>button.onclick=()=>{if(busy&&button.dataset.tab!=='import'){toast('图片正在识别，请稍候。');return;} tab=button.dataset.tab;render();window.scrollTo(0,0);});
   document.querySelectorAll('[data-month]').forEach(button=>button.onclick=()=>{month=new Date(month.getFullYear(),month.getMonth()+Number(button.dataset.month),1);render();});
   document.querySelectorAll('[data-day]').forEach(button=>button.onclick=()=>{selected=button.dataset.day;const d=dateAt(selected);month=new Date(d.getFullYear(),d.getMonth(),1);render();});
@@ -105,11 +143,15 @@ const actions={
 };
 function download(content,name,type){const url=URL.createObjectURL(new Blob([content],{type}));const a=document.createElement('a');a.href=url;a.download=name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);toast('已导出，可在下载文件中查看。');}
 function showDialog(markup){const dialog=$('#editor');dialog.innerHTML=markup;dialog.showModal();dialog.querySelector('[data-close]').onclick=()=>dialog.close();dialog.addEventListener('click',e=>{if(e.target===dialog){const rect=dialog.getBoundingClientRect();if(e.clientX<rect.left||e.clientX>rect.right||e.clientY<rect.top||e.clientY>rect.bottom)dialog.close();}},{once:true});}
-function editEvent(existing) {
-  const start=dateAt(selected,'09:00'), event=existing?{...existing}:{id:uid(),title:'',start:start.toISOString(),end:new Date(+start+3600000).toISOString(),category:'study',notes:''};
+function editEvent(existing,preset={}) {
+  const start=dateAt(selected,'09:00'), event=existing?{...existing}:{id:uid(),title:'',start:start.toISOString(),end:new Date(+start+3600000).toISOString(),category:'study',notes:'',...preset};
   showDialog(`<form id="event-form"><div class="row spread"><h2>${existing?'编辑日程':'新建日程'}</h2><button type="button" class="tiny-btn" data-close aria-label="关闭">${icon('close')}</button></div><label class="field">标题<input name="title" required maxlength="500" value="${esc(event.title)}" placeholder="例如：高等数学、自习"></label><div class="field-row"><label class="field">开始<input name="start" type="datetime-local" required value="${localInput(event.start)}"></label><label class="field">结束<input name="end" type="datetime-local" required value="${localInput(event.end)}"></label></div><label class="field">类别<select name="category">${categoryOptions(event.category)}</select></label><label class="field">备注<textarea name="notes" maxlength="5000" placeholder="地点、准备事项…">${esc(event.notes)}</textarea></label>${!existing?'<label class="field">每周重复<select name="repeat"><option value="1">不重复</option><option value="4">连续 4 周</option><option value="8">连续 8 周</option><option value="16">连续 16 周</option></select></label>':''}<p class="error" id="editor-error" role="alert"></p><div class="actions">${existing?`<button type="button" class="btn danger" id="delete-event">删除</button>`:''}<button type="button" class="btn" id="cancel-event">取消</button><button class="btn primary" type="submit">保存日程</button></div></form>`);
   $('#cancel-event').onclick=()=>$('#editor').close();
-  if(existing)$('#delete-event').onclick=()=>{if(confirm('删除这条日程？')&&change(next=>{next.events=next.events.filter(e=>e.id!==existing.id);})){ $('#editor').close();toast('日程已删除');}};
+  if(existing)$('#delete-event').onclick=()=>{
+    const button=$('#delete-event');
+    if(button.dataset.confirm!=='yes'){button.dataset.confirm='yes';button.textContent='确认删除';$('#editor-error').textContent='再次点“确认删除”移除这条日程；删除后可撤销。';return;}
+    if(change(next=>{next.events=next.events.filter(e=>e.id!==existing.id);})){ $('#editor').close();toast('日程已删除',()=>{if(!data.events.some(e=>e.id===existing.id)&&change(next=>next.events.push(existing)))toast('已撤销删除');});}
+  };
   $('#event-form').onsubmit=e=>{e.preventDefault();const f=new FormData(e.target);if(!f.get('start')||!f.get('end'))return;const nextEvent={...event,title:String(f.get('title')).trim(),start:new Date(f.get('start')).toISOString(),end:new Date(f.get('end')).toISOString(),category:f.get('category'),notes:String(f.get('notes'))};if(!validEvent(nextEvent)){$('#editor-error').textContent='请填写标题，结束时间必须晚于开始时间。';return;}const events=Array.from({length:Number(f.get('repeat')||1)},(_,i)=>({...nextEvent,id:i===0?event.id:uid(),start:addDays(nextEvent.start,i*7).toISOString(),end:addDays(nextEvent.end,i*7).toISOString()}));if(events.some((ev,i)=>[...data.events.filter(other=>other.id!==event.id),...events.slice(0,i)].some(other=>overlap(ev,other)))&&!confirm('日程存在时间重叠，仍然保存吗？'))return;if(change(next=>{next.events=next.events.filter(ev=>ev.id!==event.id);next.events.push(...events);})){ $('#editor').close();toast('日程已保存'); }};
 }
 function editTask(existing) {
@@ -136,3 +178,4 @@ async function recognize(file){
 window.addEventListener('storage',event=>{if(event.key!==KEY)return;try{data=event.newValue?validateBackup(JSON.parse(event.newValue)):blank();rawBackup=event.newValue||'';loadError='';render();toast('已同步此浏览器其他窗口的变更。');}catch{loadError='其他窗口的数据无效，已暂停写入。';render();}});
 render();
 if('serviceWorker' in navigator)navigator.serviceWorker.register('./sw.js').catch(()=>{console.info('离线缓存未启用，联网功能仍可使用。');});
+

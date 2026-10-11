@@ -5,6 +5,35 @@ export const dayKey = date => { const d = new Date(date); return `${d.getFullYea
 export const dateAt = (day, time='00:00') => new Date(`${day}T${time}:00`);
 export const localInput = value => { const d = new Date(value); return `${dayKey(d)}T${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; };
 export const addDays = (date, count) => { const d = new Date(date); d.setDate(d.getDate()+count); return d; };
+export const startOfWeek = day => {
+  const date=dateAt(dayKey(day instanceof Date?day:dateAt(day)));
+  return addDays(date,-((date.getDay()+6)%7));
+};
+
+// Clip events to local calendar days, then assign separate lanes to overlaps.
+export function layoutWeek(events, anchorDay) {
+  const monday=startOfWeek(anchorDay);
+  return Array.from({length:7},(_,index)=>{
+    const date=addDays(monday,index), nextDay=addDays(date,1), day=dayKey(date);
+    const segments=events.filter(e=>validEvent(e)&&+new Date(e.start)<+nextDay&&+new Date(e.end)>+date).map(event=>{
+      const start=new Date(Math.max(+date,+new Date(event.start))),end=new Date(Math.min(+nextDay,+new Date(event.end)));
+      const startMinute=start.getHours()*60+start.getMinutes();
+      const endMinute=+end===+nextDay?1440:Math.max(startMinute+1,end.getHours()*60+end.getMinutes());
+      return {event,day,start:start.toISOString(),end:end.toISOString(),startMinute,endMinute,
+        continuesBefore:+new Date(event.start)<+date,continuesAfter:+new Date(event.end)>+nextDay,lane:0,laneCount:1};
+    }).sort((a,b)=>+new Date(a.start)-+new Date(b.start)||+new Date(b.end)-+new Date(a.end)||a.event.id.localeCompare(b.event.id));
+    let group=[],groupEnd=0,laneEnds=[];
+    const finish=()=>{for(const item of group)item.laneCount=laneEnds.length;group=[];laneEnds=[];groupEnd=0;};
+    for(const segment of segments){
+      if(group.length&&+new Date(segment.start)>=groupEnd)finish();
+      let lane=laneEnds.findIndex(end=>end<=+new Date(segment.start));
+      if(lane<0)lane=laneEnds.length;
+      segment.lane=lane;laneEnds[lane]=+new Date(segment.end);group.push(segment);groupEnd=Math.max(groupEnd,+new Date(segment.end));
+    }
+    finish();
+    return {day,date,segments};
+  });
+}
 export const overlap = (a,b,buffer=0) => +new Date(a.start) < +new Date(b.end)+buffer*60000 && +new Date(a.end) > +new Date(b.start)-buffer*60000;
 const validDate = value => typeof value==='string' && /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(+new Date(value));
 export const validEvent = e => !!e && typeof e.id==='string' && typeof e.title==='string' && e.title.trim().length>0 && e.title.length<=500 && Object.hasOwn(categories,e.category) && validDate(e.start) && validDate(e.end) && +new Date(e.end)>+new Date(e.start) && typeof e.notes==='string';
@@ -88,3 +117,4 @@ export function proposePlan(tasks, events, settings, fromDay, now=new Date()) {
   }
   return result;
 }
+
