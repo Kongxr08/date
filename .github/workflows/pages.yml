@@ -1,12 +1,15 @@
 name: Publish calendar PWA
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '20 1 * * *'
   push:
     branches: [main]
     paths:
       - 'dist/**'
       - 'tests/**'
       - 'package.json'
+      - 'sync-official-holidays.mjs'
       - '.github/workflows/pages.yml'
 permissions:
   contents: read
@@ -21,6 +24,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Read official State Council holiday notices
+        run: node sync-official-holidays.mjs
       - run: npm test
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
