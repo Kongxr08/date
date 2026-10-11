@@ -43,7 +43,73 @@ export function validateBackup(data) {
   if (new Set(data.events.map(e=>e.id)).size!==data.events.length || new Set(data.tasks.map(t=>t.id)).size!==data.tasks.length) throw new Error('备份包含重复 ID。');
   const s=data.settings;
   if (!s || !Number.isInteger(s.startHour) || !Number.isInteger(s.endHour) || s.startHour<0 || s.endHour>24 || s.startHour>=s.endHour || typeof s.lunchBreak!=='boolean' || typeof s.skipWeekends!=='boolean' || ![0,5,10,15,30,60].includes(s.buffer)) throw new Error('备份的排程设置无效。');
+  if (data.semester!==undefined) validateSemester(data.semester);
+  if (data.holidayCalendars!==undefined) {
+    if (!Array.isArray(data.holidayCalendars) || data.holidayCalendars.length>100) throw new Error('假期日历无效。');
+    data.holidayCalendars.forEach(c=>validateHolidayCalendar(c,c.year));
+    if (new Set(data.holidayCalendars.map(c=>c.year)).size!==data.holidayCalendars.length) throw new Error('假期年份重复。');
+  }
   return data;
+}
+
+const validDay = day => typeof day==='string' && /^\d{4}-\d{2}-\d{2}$/.test(day) && Number.isFinite(+dateAt(day)) && dayKey(dateAt(day))===day;
+const validClock = clock => typeof clock==='string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(clock);
+export function validateSemester(s) {
+  if (!s || typeof s.id!=='string' || !s.id || typeof s.name!=='string' || s.name.length>100 || !validDay(s.start) || +s.start.slice(0,4)<1900 || +s.start.slice(0,4)>2199 || !Number.isInteger(s.weeks) || s.weeks<1 || s.weeks>52 || !Array.isArray(s.templates) || s.templates.length>100) throw new Error('请填写有效的开始日期和 1–52 周的学期长度，固定课程最多 100 条。');
+  if (!s.templates.every(t=>t && typeof t.id==='string' && t.id && typeof t.title==='string' && t.title.trim() && t.title.length<=500 && Number.isInteger(t.weekday) && t.weekday>=1 && t.weekday<=7 && validClock(t.start) && (validClock(t.end)||t.end==='24:00') && t.end>t.start && Object.hasOwn(categories,t.category) && typeof t.notes==='string' && t.notes.length<=5000) || new Set(s.templates.map(t=>t.id)).size!==s.templates.length) throw new Error('固定课程需要有效的星期、标题和当天起止时间；跨午夜课程请拆成两条。');
+  return s;
+}
+export const semesterEnd = s => dayKey(addDays(dateAt(s.start),s.weeks*7-1));
+export const semesterYears = s => Array.from({length:+semesterEnd(s).slice(0,4)-+s.start.slice(0,4)+1},(_,i)=>+s.start.slice(0,4)+i);
+export function validateHolidayCalendar(c,year) {
+  const official = url => { try { const u=new URL(url); return u.protocol==='https:' && (u.hostname==='gov.cn'||u.hostname.endsWith('.gov.cn')); } catch { return false; } };
+  if (!c || !Number.isInteger(year) || year<1900 || year>2200 || c.year!==year || !Array.isArray(c.papers) || !c.papers.length || c.papers.length>50 || !c.papers.every(official) || !Array.isArray(c.days) || !c.days.length || c.days.length>366 || !c.days.every(d=>d && validDay(d.date) && +d.date.slice(0,4)===year && typeof d.name==='string' && d.name.trim() && d.name.length<=100 && typeof d.isOffDay==='boolean') || !c.days.some(d=>d.isOffDay) || new Set(c.days.map(d=>d.date)).size!==c.days.length) throw new Error(`${year} 年假期数据无效，未用于排课。`);
+  return {year,papers:[...c.papers],days:c.days.map(({date,name,isOffDay})=>({date,name,isOffDay}))};
+}
+// Offline fallback transcribed from the State Council's published annual notices.
+const holidayRanges = (year,paper,ranges) => ({year,papers:[paper],days:ranges.flatMap(([name,start,end])=>{
+  const days=[];for(let d=dateAt(`${year}-${start}`);dayKey(d)<=`${year}-${end}`;d=addDays(d,1))days.push({date:dayKey(d),name,isOffDay:true});return days;
+})});
+export const bundledHolidays = [
+  holidayRanges(2025,'https://www.gov.cn/zhengce/content/202411/content_6986382.htm',[
+    ['元旦','01-01','01-01'],['春节','01-28','02-04'],['清明节','04-04','04-06'],['劳动节','05-01','05-05'],['端午节','05-31','06-02'],['国庆节、中秋节','10-01','10-08']]),
+  holidayRanges(2026,'https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm',[
+    ['元旦','01-01','01-03'],['春节','02-15','02-23'],['清明节','04-04','04-06'],['劳动节','05-01','05-05'],['端午节','06-19','06-21'],['中秋节','09-25','09-27'],['国庆节','10-01','10-07']])
+];
+export function holidayMap(calendars=bundledHolidays) {
+  return new Map(calendars.flatMap(c=>validateHolidayCalendar(c,c.year).days.filter(d=>d.isOffDay).map(d=>[d.date,d.name])));
+}
+export async function fetchHolidayYear(year,fetcher=globalThis.fetch) {
+  const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),10000);
+  try {
+    const response=await fetcher(`https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/${year}.json`,{signal:controller.signal,cache:'no-store'});
+    if(!response.ok)throw new Error(`${year} 年假期尚未获取（HTTP ${response.status}），请在公布后重试。`);
+    return validateHolidayCalendar(await response.json(),year);
+  } catch(error) {
+    if(error.name==='AbortError')throw new Error(`${year} 年假期获取超时，请检查网络后重试。`);
+    if(error instanceof TypeError)throw new Error(`${year} 年假期无法联网获取，请检查网络后重试。`);
+    throw error;
+  } finally { clearTimeout(timeout); }
+}
+export function generateSemester(s,calendars) {
+  validateSemester(s);
+  const valid=calendars.map(c=>validateHolidayCalendar(c,c.year));
+  const missing=semesterYears(s).filter(year=>!valid.some(c=>c.year===year));
+  if(missing.length)throw new Error(`缺少 ${missing.join('、')} 年假期数据。请联网更新国家假期；未获取到的年份暂不生成课程，已保存的固定课表仍可编辑。`);
+  const holidays=holidayMap(valid),events=[],skipped=[];
+  for(let i=0;i<s.weeks*7;i++){
+    const date=addDays(dateAt(s.start),i),day=dayKey(date),weekday=(date.getDay()+6)%7+1;
+    for(const t of s.templates.filter(t=>t.weekday===weekday)) {
+      if(holidays.has(day)){skipped.push({day,title:t.title,holiday:holidays.get(day)});continue;}
+      events.push({id:`semester:${s.id}:${t.id}:${day}`,semesterId:s.id,templateId:t.id,occurrenceDay:day,title:t.title,start:dateAt(day,t.start).toISOString(),end:dateAt(day,t.end).toISOString(),category:t.category,notes:t.notes});
+    }
+  }
+  return {events,skipped};
+}
+export function replaceSemesterEvents(existing,s,generated) {
+  const retained=existing.filter(e=>e.semesterId!==s.id),events=[...retained,...generated];
+  if(events.length>10000 || new Set(events.map(e=>e.id)).size!==events.length || !events.every(validEvent))throw new Error('排课后日程数量过多或 ID 冲突，请减少学期课程。');
+  return events;
 }
 
 export function parseSchedule(text, referenceDay) {
