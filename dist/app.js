@@ -1,19 +1,20 @@
-import {categories,defaultSettings,uid,dayKey,dateAt,localInput,addDays,startOfWeek,layoutWeek,overlap,validEvent,validTask,validateBackup,parseSchedule,proposePlan,validateSemester,semesterEnd,semesterYears,bundledHolidays,holidayMap,fetchHolidayYear,generateSemester,replaceSemesterEvents} from './core.js';
+import {categories,defaultSettings,uid,dayKey,dateAt,localInput,addDays,startOfWeek,layoutWeek,overlap,validEvent,validTask,validateBackup,parseSchedule,proposePlan,validateSemester,semesterEnd,semesterYears,bundledHolidays,holidayMap,fetchHolidayYear,generateSemester,replaceSemesterEvents,syncSemesterData,semesterCalendars,validateHolidayCalendar} from './core.js';
 const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const paths={calendar:'M4 5h16v16H4z M7 3v4 M17 3v4 M4 10h16 M8 14h1 M15 14h1 M8 17h1',scan:'M8 3H3v5 M16 3h5v5 M3 16v5h5 M21 16v5h-5 M7 9h10 M7 13h10 M7 17h5',plan:'M4 5h16v16H4z M8 9l1 1 2-3 M14 9h3 M8 16l1 1 2-3 M14 16h3',settings:'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8 M9 3h6l1 3 3 1 2 5-2 2v3l-5 3-2-1-3 1-5-3v-3l-2-2 2-5 3-1z',plus:'M12 5v14 M5 12h14',left:'M15 5l-7 7 7 7',right:'M9 5l7 7-7 7',close:'M6 6l12 12 M18 6L6 18',edit:'M4 16v4h4L20 8l-4-4z M13 7l4 4',trash:'M3 6h18 M8 6V3h8v3 M6 6l1 15h10l1-15 M10 10v7 M14 10v7',clock:'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M12 7v5l3 2',shield:'M12 3l8 3v6c0 5-8 9-8 9s-8-4-8-9V6z M8 12l3 3 5-6',upload:'M4 15v6h16v-6 M12 16V3 M7 8l5-5 5 5',download:'M4 15v6h16v-6 M12 3v13 M7 11l5 5 5-5',spark:'M12 3l2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5z',check:'M5 12l4 4L19 6',search:'M10 3a7 7 0 1 0 0 14 7 7 0 0 0 0-14 M15 15l6 6'};
 const icon=name=>`<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${paths[name]||paths.calendar}"/></svg>`;
 const KEY='timecanvas.data.v1';
 const blank=()=>({version:1,events:[],tasks:[],settings:{...defaultSettings}});
-let data=blank(), loadError='', rawBackup='';
+let data=blank(), loadError='', rawBackup='',semesterSyncError='';
 try { rawBackup=localStorage.getItem(KEY)||''; if(rawBackup) data=validateBackup(JSON.parse(rawBackup)); }
 catch { loadError='无法读取本机数据，已暂停写入。请先导出原始备份，再恢复有效备份。'; }
+if(!loadError&&data.semester){try{const synced=syncSemesterData(data);if(JSON.stringify(synced)!==JSON.stringify(data))localStorage.setItem(KEY,JSON.stringify(synced));data=synced;}catch(error){semesterSyncError='学期同步失败：'+error.message;}}
 let tab='calendar', selected=dayKey(new Date()), month=new Date(new Date().getFullYear(),new Date().getMonth(),1), filter='', drafts=[], ocrText='', referenceDay=selected, imageURL='', busy=false, proposals=[], planSnapshot='', planFrom=selected;
 let calendarMode='week',weekScroll={anchor:'',top:8*64,left:0};
 let semesterPreview=null,semesterSnapshot='',holidayBusy=false,holidayStatus='',newSemesterId=uid();
 const weekdays=['周一','周二','周三','周四','周五','周六','周日'];
 const semesterConfig=()=>data.semester||{id:newSemesterId,name:'我的学期',start:selected,weeks:16,templates:[]};
-const calendars=()=>[...bundledHolidays.filter(c=>!(data.holidayCalendars||[]).some(saved=>saved.year===c.year)),...(data.holidayCalendars||[])];
+const calendars=()=>semesterCalendars(data);
 try { const saved=localStorage.getItem('timecanvas.calendarMode');if(['week','month'].includes(saved))calendarMode=saved; } catch {}
 const formatDate=(value,options={month:'long',day:'numeric',weekday:'long'})=>new Intl.DateTimeFormat('zh-CN',options).format(new Date(value));
 const time=value=>formatDate(value,{hour:'2-digit',minute:'2-digit',hour12:false});
@@ -26,7 +27,7 @@ function toast(message,undo=null) {
 }
 function commit(next) {
   if(loadError) { toast(loadError); return false; }
-  try { validateBackup(next); localStorage.setItem(KEY,JSON.stringify(next)); data=next; return true; }
+  try { next=syncSemesterData(next,data);validateBackup(next); localStorage.setItem(KEY,JSON.stringify(next)); data=next;semesterSyncError=''; return true; }
   catch(error) { toast('保存失败：'+error.message+' 请检查浏览器存储空间。'); return false; }
 }
 function change(fn) { const next=structuredClone(data); fn(next); if(commit(next)) { render(); return true; } return false; }
@@ -46,10 +47,27 @@ function render() {
 }
 function eventCard(e, showDate=false) {
   const conflict=data.events.some(other=>other.id!==e.id&&overlap(e,other));
-  return `<article class="event-card ${esc(e.category)}"><div class="event-time">${time(e.start)}<small>${dayKey(e.start)!==dayKey(e.end)?'次日 ':''}${time(e.end)}</small></div><div class="event-body"><button class="event-title" data-edit-event="${esc(e.id)}">${esc(e.title)}</button><p class="subtle">${showDate?formatDate(e.start,{month:'numeric',day:'numeric'})+' · ':''}${categories[e.category]}${e.taskId?' · 已规划':''}${e.semesterId?' · 学期课程':''}</p>${conflict?'<span class="badge warn">时间重叠</span>':''}</div><button class="tiny-btn" aria-label="编辑 ${esc(e.title)}" data-edit-event="${esc(e.id)}">${icon('edit')}</button></article>`;
+  return `<article class="event-card ${esc(e.category)}"><div class="event-time">${time(e.start)}<small>${dayKey(e.start)!==dayKey(e.end)?'次日 ':''}${time(e.end)}</small></div><div class="event-body"><button class="event-title" data-edit-event="${esc(e.id)}">${esc(e.title)}</button><p class="subtle">${showDate?formatDate(e.start,{month:'numeric',day:'numeric'})+' · ':''}${categories[e.category]}${e.taskId?' · 已规划':''}${e.semesterId?' · 学期课程':''}${e.holidayPending?' · 假期待确认':''}</p>${conflict?'<span class="badge warn">时间重叠</span>':''}</div><button class="tiny-btn" aria-label="编辑 ${esc(e.title)}" data-edit-event="${esc(e.id)}">${icon('edit')}</button></article>`;
+}
+function openSemesterCalendar() {
+  const s=data.semester;
+  if(s){
+    const events=data.events.filter(e=>e.semesterId===s.id).sort((a,b)=>new Date(a.start)-new Date(b.start)),monday=startOfWeek(selected),end=addDays(monday,7);
+    const inSemester=selected>=s.start&&selected<=semesterEnd(s);
+    if(!inSemester||!events.some(e=>new Date(e.start)>=monday&&new Date(e.start)<end)){
+      const upcoming=events.find(e=>new Date(e.start)>=dateAt(dayKey(new Date())))||events[0];selected=upcoming?dayKey(upcoming.start):s.start;
+    }
+    const date=dateAt(selected);month=new Date(date.getFullYear(),date.getMonth(),1);
+  }
+  tab='calendar';calendarMode='week';try{localStorage.setItem('timecanvas.calendarMode','week');}catch{}render();window.scrollTo(0,0);
+}
+function semesterCalendarBanner() {
+  const s=data.semester;if(!s)return '';
+  const missing=semesterYears(s).filter(year=>!calendars().some(c=>c.year===year)),count=data.events.filter(e=>e.semesterId===s.id).length;
+  return `<div class="callout semester-calendar-banner"><div><strong>${esc(s.name||'学期课表')} · 已自动同步 ${count} 次课程</strong><p>${s.start}–${semesterEnd(s)} · ${s.weeks} 周${selected>=s.start&&selected<=semesterEnd(s)?` · 当前第 ${Math.floor((dateAt(selected)-dateAt(s.start))/86400000/7)+1} 周`:''}</p>${missing.length?`<p>${missing.join('、')} 年假期待确认，课程先按固定星期显示，取得安排后自动更新。</p>`:''}${semesterSyncError?`<p role="alert">${esc(semesterSyncError)}</p>`:''}</div><button class="btn" data-action="semester-calendar">查看学期课程</button></div>`;
 }
 function calendarView() {
-  return `<div class="view-toolbar"><div class="view-switch" role="group" aria-label="日历视图"><button data-calendar-mode="week" aria-pressed="${calendarMode==='week'}" class="${calendarMode==='week'?'active':''}">周课表</button><button data-calendar-mode="month" aria-pressed="${calendarMode==='month'}" class="${calendarMode==='month'?'active':''}">月历</button></div><p class="subtle">${calendarMode==='week'?'点空白时间添加课程，点课程修改或删除':'选择日期查看当天安排'}</p></div>${calendarMode==='week'?weekView():monthView()}`;
+  return `${semesterCalendarBanner()}<div class="view-toolbar"><div class="view-switch" role="group" aria-label="日历视图"><button data-calendar-mode="week" aria-pressed="${calendarMode==='week'}" class="${calendarMode==='week'?'active':''}">周课表</button><button data-calendar-mode="month" aria-pressed="${calendarMode==='month'}" class="${calendarMode==='month'?'active':''}">月历</button></div><p class="subtle">${calendarMode==='week'?'点空白时间添加课程，点课程修改或删除':'选择日期查看当天安排'}</p></div>${calendarMode==='week'?weekView():monthView()}`;
 }
 function weekView(){
   const days=layoutWeek(data.events,selected),first=days[0].date,last=days[6].date,today=dayKey(new Date());
@@ -62,7 +80,7 @@ function weekView(){
     const blocks=d.segments.map(s=>{
       const e=s.event,top=s.startMinute/60*64,height=(s.endMinute-s.startMinute)/60*64;
       const label=`${e.title}，${formatDate(d.date)}，${time(s.start)}至${s.endMinute===1440?'24:00':time(s.end)}，点击编辑或删除`;
-      return `<button class="week-event ${esc(e.category)} ${height<37?'compact':''}" data-edit-event="${esc(e.id)}" style="top:${top}px;height:${Math.max(16,height)}px;left:calc(${s.lane/s.laneCount*100}% + 3px);width:calc(${100/s.laneCount}% - 6px)" aria-label="${esc(label)}" title="${esc(label)}"><strong>${esc(e.title)}</strong><span>${time(s.start)}–${s.endMinute===1440?'24:00':time(s.end)}</span>${s.continuesBefore||s.continuesAfter?'<small>跨日课程</small>':''}</button>`;
+      return `<button class="week-event ${esc(e.category)} ${height<37?'compact':''}" data-edit-event="${esc(e.id)}" style="top:${top}px;height:${Math.max(16,height)}px;left:calc(${s.lane/s.laneCount*100}% + 3px);width:calc(${100/s.laneCount}% - 6px)" aria-label="${esc(label)}" title="${esc(label)}"><strong>${esc(e.title)}</strong><span>${time(s.start)}–${s.endMinute===1440?'24:00':time(s.end)}</span>${s.continuesBefore||s.continuesAfter?'<small>跨日课程</small>':''}${e.holidayPending?'<small>假期待确认</small>':''}</button>`;
     }).join('');
     return `<div class="week-day-column ${d.day===today?'is-today':''}" data-column-day="${d.day}">${slots}${blocks}</div>`;
   }).join('');
@@ -96,7 +114,7 @@ function semesterView() {
   const disabled=holidayBusy?'disabled':'';
   const cards=courses.map(t=>`<article class="semester-course ${esc(t.category)}"><div><span class="badge">${weekdays[t.weekday-1]} · ${t.start}–${t.end}</span><h3>${esc(t.title)}</h3>${t.notes?`<p class="subtle">${esc(t.notes)}</p>`:''}</div><div class="row"><button class="tiny-btn" data-edit-template="${esc(t.id)}" aria-label="编辑固定课程 ${esc(t.title)}" ${disabled}>${icon('edit')}</button><button class="tiny-btn" data-delete-template="${esc(t.id)}" aria-label="删除固定课程 ${esc(t.title)}" ${disabled}>${icon('trash')}</button></div></article>`).join('');
   const preview=semesterPreview;
-  return `<p class="section-intro">设置学期长度，再添加每周固定的课程。预览后一次性加入日历，仍可单独编辑或删除某次课程。</p><div class="two-cols semester-grid"><section class="panel"><h2>01 / 学期设置</h2><form id="semester-form"><label class="field">学期名称<input name="name" maxlength="100" value="${esc(s.name)}" ${disabled}></label><div class="field-row"><label class="field">开始日期<input type="date" name="start" required value="${s.start}" ${disabled}></label><label class="field">学期长度（周）<input type="number" name="weeks" min="1" max="52" step="1" required value="${s.weeks}" ${disabled}></label></div><p class="callout" id="semester-end">共 ${s.weeks} 周 · 最后一天 ${semesterEnd(s)}（含当天）</p><button class="btn" type="submit" ${disabled}>保存学期设置</button></form><div class="top-gap"><h2>国家假期</h2><p class="hint">跳过国务院公布的整段放假日期，包括连休中的周末。补班日不调课、不补课，仍按当天星期安排。周末固定课程在非假期照常排课。</p><div class="holiday-years">${years.map(y=>{const c=available.find(c=>c.year===y);return `<p><span class="badge ${c?'':'warn'}">${y} 年 · ${c?'已取得':'未取得'}</span>${c?` <a href="${esc(c.papers[0])}" target="_blank" rel="noopener">国务院通知 ↗</a>`:''}</p>`;}).join('')}</div><button class="btn" type="button" data-semester-action="holidays" ${disabled}>${icon('download')}${holidayBusy?'正在获取假期…':'联网更新国家假期'}</button><p class="hint" role="status">${esc(holidayStatus||'内置 2025、2026 年已公布安排，离线也能排课。联网更新通过 holiday-cn 同步国务院通知；更新后需要重新预览并确认排课。')}</p>${missing.length?`<p class="callout">尚未取得 ${missing.join('、')} 年假期数据。可保存固定课表；取得覆盖整个学期的数据后才能生成，避免遗漏假期。</p>`:''}<a class="subtle" href="https://github.com/NateScarlet/holiday-cn" target="_blank" rel="noopener">假期数据同步项目 ↗</a></div></section><section class="panel"><div class="panel-head"><h2>02 / 固定周课表</h2><span class="badge">${courses.length} 门 / 周</span></div><div class="row wrap"><button class="btn primary" data-semester-action="add" ${disabled}>${icon('plus')}添加固定课程</button><button class="btn" data-semester-action="copy" ${disabled}>使用日历当前周</button></div><p class="hint">当前周为 ${dayKey(startOfWeek(selected))} 起的七天。可先从图片导入课程，再把这一周复制为固定课表；相同课程不会重复复制。跨午夜课程请拆成当天两段。</p><div class="semester-courses">${cards||'<div class="empty"><h3>添加一周的课程</h3><p>选择星期、开始时间和结束时间，之后按周重复。</p></div>'}</div><p class="hint">修改固定课表后，需要重新预览并确认，日历中的课程才会更新。</p><button class="btn primary full" data-semester-action="preview" ${disabled||!courses.length?'disabled':''}>${icon('spark')}预览整个学期排课</button></section></div>${preview?`<section class="panel semester-preview top-gap"><div class="panel-head"><h2>03 / 确认排课</h2><span class="badge">${preview.events.length} 次课程</span></div><div class="callout">${esc(s.name)} · ${s.start}–${semesterEnd(s)}<br>生成 ${preview.events.length} 次课程，因假期跳过 ${preview.skipped.length} 次。<br>替换当前学期已生成的 ${preview.replaced} 条课程，保留其他 ${preview.retained} 条日程。</div><p class="hint">重新生成将覆盖本学期课程的单次修改，并恢复手动删除的课次。固定课表已删除的课程将从本学期日历移除。确认前请核对下面的预览。</p>${preview.conflicts?`<label class="toggle semester-conflict"><input id="semester-conflict-ok" type="checkbox">${preview.conflicts} 次课程有时间重叠，我已核对并接受重叠。</label>`:''}<details open><summary>排课预览（前 30 次，共 ${preview.events.length} 次）</summary><div class="semester-list">${preview.events.slice(0,30).map(e=>`<p><strong>${esc(e.title)}</strong><span>${eventRange(e)} · ${weekdays[(new Date(e.start).getDay()+6)%7]}</span></p>`).join('')||'<p>全部课次落在假期，没有课程需要生成。</p>'}</div></details>${preview.skipped.length?`<details><summary>假期停课（前 30 次，共 ${preview.skipped.length} 次）</summary><div class="semester-list">${preview.skipped.slice(0,30).map(e=>`<p><strong>${esc(e.title)}</strong><span>${e.day} · ${esc(e.holiday)}</span></p>`).join('')}</div></details>`:''}<div class="row wrap top-gap"><button class="btn primary" data-semester-action="apply">${icon('check')}确认排课并更新日历</button><button class="btn" data-semester-action="cancel">取消预览</button></div></section>`:''}`;
+  return `<p class="section-intro">设置学期长度，再添加每周固定的课程。保存固定课程后，自动显示在日历周课表中；仍可单独编辑或删除某次课程。</p><div class="two-cols semester-grid"><section class="panel"><h2>01 / 学期设置</h2><form id="semester-form"><label class="field">学期名称<input name="name" maxlength="100" value="${esc(s.name)}" ${disabled}></label><div class="field-row"><label class="field">开始日期<input type="date" name="start" required value="${s.start}" ${disabled}></label><label class="field">学期长度（周）<input type="number" name="weeks" min="1" max="52" step="1" required value="${s.weeks}" ${disabled}></label></div><p class="callout" id="semester-end">共 ${s.weeks} 周 · 最后一天 ${semesterEnd(s)}（含当天）</p><button class="btn" type="submit" ${disabled}>保存学期设置</button></form><div class="top-gap"><h2>国家假期</h2><p class="hint">跳过国务院公布的整段放假日期，包括连休中的周末。补班日不调课、不补课，仍按当天星期安排。周末固定课程在非假期照常排课。</p><div class="holiday-years">${years.map(y=>{const c=available.find(c=>c.year===y);return `<p><span class="badge ${c?'':'warn'}">${y} 年 · ${c?(c.source==='official-notice'?'官方通知':'公告整理数据'):'假期待确认'}</span>${c?` <a href="${esc(c.papers[0])}" target="_blank" rel="noopener">国务院通知 ↗</a>`:''}</p>`;}).join('')}</div><button class="btn" type="button" data-semester-action="holidays" ${disabled}>${icon('download')}${holidayBusy?'正在获取假期…':'联网更新国家假期'}</button><p class="hint" role="status">${esc(holidayStatus||'优先读取网站同步的国务院官方通知数据，内置 2025、2026 年已核实安排。更新成功后自动同步停课日期。官方数据不可用时尝试公告整理数据，并显示来源。')}</p>${missing.length?`<p class="callout">尚未取得 ${missing.join('、')} 年假期数据。这些年份先按固定星期显示课程，并标注“假期待确认”；取得放假安排后自动跳过整段假期。</p>`:''}<a class="subtle" href="https://sousuo.www.gov.cn/zcwjk/policyDocumentLibrary?q=%E8%8A%82%E5%81%87%E6%97%A5%E5%AE%89%E6%8E%92%E7%9A%84%E9%80%9A%E7%9F%A5&amp;t=zhengcelibrary" target="_blank" rel="noopener">中国政府网放假通知 ↗</a></div></section><section class="panel"><div class="panel-head"><h2>02 / 固定周课表</h2><span class="badge">${courses.length} 门 / 周</span></div><div class="row wrap"><button class="btn primary" data-semester-action="add" ${disabled}>${icon('plus')}添加固定课程</button><button class="btn" data-semester-action="copy" ${disabled}>使用日历当前周</button></div><p class="hint">当前周为 ${dayKey(startOfWeek(selected))} 起的七天。可先从图片导入课程，再把这一周复制为固定课表；相同课程不会重复复制。跨午夜课程请拆成当天两段。</p><div class="semester-courses">${cards||'<div class="empty"><h3>添加一周的课程</h3><p>选择星期、开始时间和结束时间，之后按周重复。</p></div>'}</div><p class="hint">固定课程和学期设置保存后，会立即同步到日历。预览可用于核对，确认重置会恢复整学期的固定安排。</p><button class="btn primary full" data-semester-action="calendar">${icon('calendar')}查看日历周课表</button><button class="btn full top-gap" data-semester-action="preview" ${disabled||!courses.length?'disabled':''}>${icon('spark')}预览学期课程</button></section></div>${preview?`<section class="panel semester-preview top-gap"><div class="panel-head"><h2>03 / 学期课程预览</h2><span class="badge">${preview.events.length} 次课程</span></div><div class="callout">${esc(s.name)} · ${s.start}–${semesterEnd(s)}<br>生成 ${preview.events.length} 次课程，因假期跳过 ${preview.skipped.length} 次。<br>替换当前学期已生成的 ${preview.replaced} 条课程，保留其他 ${preview.retained} 条日程。</div><p class="hint">重新生成将覆盖本学期课程的单次修改，并恢复手动删除的课次。固定课表已删除的课程将从本学期日历移除。普通保存会自动同步并保留单次修改、删除；只有确认重置才会恢复固定安排。</p>${preview.missingYears.length?`<p class="callout">${preview.missingYears.join('、')} 年假期待确认，课程先按固定星期显示。</p>`:''}${preview.conflicts?`<label class="toggle semester-conflict"><input id="semester-conflict-ok" type="checkbox">${preview.conflicts} 次课程有时间重叠，我已核对并接受重叠。</label>`:''}<details open><summary>排课预览（前 30 次，共 ${preview.events.length} 次）</summary><div class="semester-list">${preview.events.slice(0,30).map(e=>`<p><strong>${esc(e.title)}</strong><span>${eventRange(e)} · ${weekdays[(new Date(e.start).getDay()+6)%7]}</span></p>`).join('')||'<p>全部课次落在假期，没有课程需要生成。</p>'}</div></details>${preview.skipped.length?`<details><summary>假期停课（前 30 次，共 ${preview.skipped.length} 次）</summary><div class="semester-list">${preview.skipped.slice(0,30).map(e=>`<p><strong>${esc(e.title)}</strong><span>${e.day} · ${esc(e.holiday)}</span></p>`).join('')}</div></details>`:''}<div class="row wrap top-gap"><button class="btn primary" data-semester-action="apply">${icon('check')}确认重置学期课程</button><button class="btn" data-semester-action="cancel">取消预览</button></div></section>`:''}`;
 }
 function readSemesterForm() {
   const s=structuredClone(semesterConfig()),form=$('#semester-form');
@@ -117,8 +135,8 @@ async function updateHolidays(s,onlyMissing=false) {
     const results=await Promise.allSettled(years.map(y=>fetchHolidayYear(y))),next=structuredClone(data),messages=[];
     next.holidayCalendars=next.holidayCalendars||[];
     results.forEach((result,i)=>{
-      if(result.status==='fulfilled'){next.holidayCalendars=next.holidayCalendars.filter(c=>c.year!==years[i]);next.holidayCalendars.push(result.value);messages.push(`${years[i]} 年已更新`);}
-      else messages.push(`${years[i]} 年获取失败：${result.reason.message.replace(/[。.]$/,'')}；${calendars().some(c=>c.year===years[i])?'继续使用已保存数据':'此年份暂不能生成课程'}`);
+      if(result.status==='fulfilled'){next.holidayCalendars=next.holidayCalendars.filter(c=>c.year!==years[i]);next.holidayCalendars.push(result.value);messages.push(`${years[i]} 年已更新 · ${result.value.source==='official-notice'?'官方通知':'公告整理数据'}`);}
+      else messages.push(`${years[i]} 年获取失败：${result.reason.message.replace(/[。.]$/,'')}；${calendars().some(c=>c.year===years[i])?'继续使用已保存数据':'课程继续显示，假期待确认'}`);
     });
     semesterPreview=null;holidayStatus=messages.join('；');
     if(results.some(r=>r.status==='fulfilled'))commit(next);
@@ -126,7 +144,7 @@ async function updateHolidays(s,onlyMissing=false) {
   } finally {holidayBusy=false;render();}
 }
 function previewSemester(s) {
-  const result=generateSemester(s,calendars()),retained=data.events.filter(e=>e.semesterId!==s.id);
+  const result=generateSemester(s,calendars(),{allowMissing:true}),retained=data.events.filter(e=>e.semesterId!==s.id);
   replaceSemesterEvents(data.events,s,result.events);
   const ids=new Set(result.events.map(e=>e.id)),conflicts=new Set(),ordered=[...retained,...result.events].sort((a,b)=>+new Date(a.start)-+new Date(b.start));
   let active=[];
@@ -134,9 +152,22 @@ function previewSemester(s) {
   semesterPreview={...result,replaced:data.events.length-retained.length,retained:retained.length,conflicts:conflicts.size};
   semesterSnapshot=JSON.stringify(data);render();$('.semester-preview')?.scrollIntoView({behavior:'smooth',block:'start'});
 }
+async function refreshOfficialCalendars() {
+  if(!data.semester||loadError)return;
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),5000);
+  try {
+    const response=await fetch('./official-holidays.json',{cache:'no-store',signal:controller.signal});if(!response.ok)return;
+    const bank=await response.json();if(bank.version!==1||!Array.isArray(bank.calendars)||bank.calendars.length>100)return;
+    const official=bank.calendars.filter(c=>c.source==='official-notice').map(c=>validateHolidayCalendar(c,c.year)),next=structuredClone(data);
+    next.holidayCalendars=[...(next.holidayCalendars||[]).filter(c=>!official.some(o=>o.year===c.year)),...official].sort((a,b)=>a.year-b.year);
+    if(JSON.stringify(next)===JSON.stringify(data))return;
+    if(commit(next)){semesterPreview=null;holidayStatus='已读取最新官方通知数据，日历已自动同步。';if(!$('#editor').open&&!document.activeElement?.matches('input,select,textarea'))render();}
+  } catch { console.info('官方假期同步暂不可用，继续使用已保存的安排。'); }
+  finally {clearTimeout(timer);}
+}
 function bindSemester() {
   if($('#semester-form')){
-    $('#semester-form').onsubmit=e=>{e.preventDefault();try{if(saveSemester(readSemesterForm()))toast('学期设置已保存，请重新预览排课。');}catch(error){toast(error.message);}};
+    $('#semester-form').onsubmit=e=>{e.preventDefault();try{if(saveSemester(readSemesterForm()))toast('学期设置已保存，课程已自动同步到日历。');}catch(error){toast(error.message);}};
     $('#semester-form').oninput=()=>{try{const s=readSemesterForm();$('#semester-end').textContent=`共 ${s.weeks} 周 · 最后一天 ${semesterEnd(s)}（含当天）`;}catch{$('#semester-end').textContent='请填写有效开始日期和 1–52 周。';}semesterPreview=null;$('.semester-preview')?.remove();};
   }
   document.querySelectorAll('[data-semester-action]').forEach(button=>button.onclick=async()=>{
@@ -146,13 +177,14 @@ function bindSemester() {
       if(action==='apply'){
         if(!semesterPreview||semesterSnapshot!==JSON.stringify(data)){toast('日程或课表已变更，请重新预览排课。');return;}
         if(semesterPreview.conflicts&&!$('#semester-conflict-ok')?.checked){toast('请核对并勾选接受时间重叠，或先修改固定课表。');return;}
-        const s=data.semester,next=structuredClone(data);next.events=replaceSemesterEvents(data.events,s,semesterPreview.events);
+        const s=data.semester,next=structuredClone(data);next.semester.excludedOccurrences=[];next.events=replaceSemesterEvents(data.events,s,semesterPreview.events);
         if(commit(next)){const count=semesterPreview.events.length;semesterPreview=null;selected=s.start;month=new Date(dateAt(selected).getFullYear(),dateAt(selected).getMonth(),1);tab='calendar';calendarMode='week';render();toast(`学期排课完成，已安排 ${count} 次课程。`);}return;
       }
       const s=readSemesterForm();if(!saveSemester(s))return;
       if(action==='add'){editTemplate();return;}
       if(action==='holidays'){await updateHolidays(s);return;}
-      if(action==='preview'){await updateHolidays(s,true);previewSemester(data.semester);return;}
+      if(action==='preview'){previewSemester(data.semester);return;}
+      if(action==='calendar'){openSemesterCalendar();return;}
       if(action==='copy'){
         const monday=startOfWeek(selected),end=addDays(monday,7),templates=[...s.templates];let copied=0,ignored=0;
         for(const e of data.events.filter(e=>new Date(e.start)>=monday&&new Date(e.start)<end)){
@@ -167,14 +199,14 @@ function bindSemester() {
   document.querySelectorAll('[data-edit-template]').forEach(button=>button.onclick=()=>{try{const s=readSemesterForm();if(saveSemester(s))editTemplate(s.templates.find(t=>t.id===button.dataset.editTemplate));}catch(error){toast(error.message);}});
   document.querySelectorAll('[data-delete-template]').forEach(button=>button.onclick=()=>{
     if(button.dataset.confirm!=='yes'){button.dataset.confirm='yes';button.setAttribute('aria-label','确认删除固定课程');button.innerHTML='确认删除';return;}
-    try{const s=readSemesterForm(),removed=s.templates.find(t=>t.id===button.dataset.deleteTemplate);s.templates=s.templates.filter(t=>t.id!==button.dataset.deleteTemplate);if(saveSemester(s))toast('固定课程已删除，重新排课后才会移除已生成课次。',()=>{const next=structuredClone(data.semester);if(!next.templates.some(t=>t.id===removed.id)){next.templates.push(removed);saveSemester(next);}});}catch(error){toast(error.message);}
+    try{const s=readSemesterForm(),removed=s.templates.find(t=>t.id===button.dataset.deleteTemplate);s.templates=s.templates.filter(t=>t.id!==button.dataset.deleteTemplate);if(saveSemester(s))toast('固定课程已删除，日历已自动同步。',()=>{const next=structuredClone(data.semester);if(!next.templates.some(t=>t.id===removed.id)){next.templates.push(removed);saveSemester(next);}});}catch(error){toast(error.message);}
   });
 }
 function editTemplate(existing) {
   const t=existing||{id:uid(),title:'',weekday:1,start:'09:00',end:'10:00',category:'study',notes:''};
   showDialog(`<form id="template-form"><div class="row spread"><h2>${existing?'编辑':'添加'}固定课程</h2><button type="button" class="tiny-btn" data-close aria-label="关闭">${icon('close')}</button></div><label class="field">课程名称<input name="title" required maxlength="500" value="${esc(t.title)}"></label><label class="field">星期<select name="weekday">${weekdays.map((d,i)=>`<option value="${i+1}" ${t.weekday===i+1?'selected':''}>${d}</option>`).join('')}</select></label><div class="field-row"><label class="field">开始时间<input type="time" name="start" required value="${t.start}"></label><label class="field">结束时间<input type="time" name="end" value="${t.end==='24:00'?'23:59':t.end}" required></label></div><label class="toggle"><input type="checkbox" name="midnight" ${t.end==='24:00'?'checked':''}>结束于当天 24:00</label><label class="field">类别<select name="category">${categoryOptions(t.category)}</select></label><label class="field">备注<textarea name="notes" maxlength="5000">${esc(t.notes)}</textarea></label><p class="hint">课程在当天结束。跨午夜课程请按两个星期、两个时间段拆开添加。</p><p class="error" id="editor-error" role="alert"></p><div class="actions"><button type="button" class="btn" id="cancel-template">取消</button><button class="btn primary" type="submit">保存固定课程</button></div></form>`);
   $('#cancel-template').onclick=()=>$('#editor').close();
-  $('#template-form').onsubmit=e=>{e.preventDefault();try{const f=new FormData(e.target),updated={...t,title:String(f.get('title')).trim(),weekday:+f.get('weekday'),start:String(f.get('start')),end:f.has('midnight')?'24:00':String(f.get('end')),category:String(f.get('category')),notes:String(f.get('notes'))},s=structuredClone(data.semester);s.templates=s.templates.filter(old=>old.id!==t.id);s.templates.push(updated);validateSemester(s);if(saveSemester(s)){$('#editor').close();toast('固定课程已保存，请预览学期排课。');}}catch(error){$('#editor-error').textContent=error.message;}};
+  $('#template-form').onsubmit=e=>{e.preventDefault();try{const f=new FormData(e.target),updated={...t,title:String(f.get('title')).trim(),weekday:+f.get('weekday'),start:String(f.get('start')),end:f.has('midnight')?'24:00':String(f.get('end')),category:String(f.get('category')),notes:String(f.get('notes'))},s=structuredClone(data.semester);s.templates=s.templates.filter(old=>old.id!==t.id);s.templates.push(updated);validateSemester(s);if(saveSemester(s)){$('#editor').close();toast('固定课程已保存，已显示在日历周课表。');}}catch(error){$('#editor-error').textContent=error.message;}};
 }
 function settingsView() {
   const s=data.settings;
@@ -187,7 +219,7 @@ function bind() {
   document.querySelectorAll('button[data-week]').forEach(button=>button.onclick=()=>{selected=dayKey(addDays(dateAt(selected),Number(button.dataset.week)*7));const d=dateAt(selected);month=new Date(d.getFullYear(),d.getMonth(),1);render();});
   document.querySelectorAll('[data-slot-day]').forEach(button=>button.onclick=()=>{selected=button.dataset.slotDay;const start=dateAt(selected);start.setMinutes(Number(button.dataset.slotMinute));render();editEvent(undefined,{start:start.toISOString(),end:new Date(+start+3600000).toISOString()});});
   if($('#week-date'))$('#week-date').onchange=e=>{if(!e.target.value)return;selected=e.target.value;const d=dateAt(selected);month=new Date(d.getFullYear(),d.getMonth(),1);render();};
-  document.querySelectorAll('[data-tab]').forEach(button=>button.onclick=()=>{if(busy&&button.dataset.tab!=='import'){toast('图片正在识别，请稍候。');return;} tab=button.dataset.tab;render();window.scrollTo(0,0);});
+  document.querySelectorAll('[data-tab]').forEach(button=>button.onclick=()=>{if(busy&&button.dataset.tab!=='import'){toast('图片正在识别，请稍候。');return;} if(tab==='semester'&&button.dataset.tab==='calendar'){openSemesterCalendar();return;}tab=button.dataset.tab;render();window.scrollTo(0,0);});
   document.querySelectorAll('[data-month]').forEach(button=>button.onclick=()=>{month=new Date(month.getFullYear(),month.getMonth()+Number(button.dataset.month),1);render();});
   document.querySelectorAll('[data-day]').forEach(button=>button.onclick=()=>{selected=button.dataset.day;const d=dateAt(selected);month=new Date(d.getFullYear(),d.getMonth(),1);render();});
   document.querySelectorAll('[data-action]').forEach(button=>button.onclick=()=>actions[button.dataset.action]?.());
@@ -208,9 +240,10 @@ function bind() {
   if($('#image-file'))$('#image-file').onchange=e=>{const file=e.target.files[0];if(file)recognize(file);};
   if($('#search'))$('#search').oninput=e=>{filter=e.target.value;$('#search-results').innerHTML=searchResults();document.querySelectorAll('#search-results [data-edit-event]').forEach(button=>button.onclick=()=>editEvent(data.events.find(ev=>ev.id===button.dataset.editEvent)));};
   if($('#settings-form'))$('#settings-form').onsubmit=e=>{e.preventDefault();const f=new FormData(e.target);const settings={startHour:+f.get('startHour'),endHour:+f.get('endHour'),buffer:+f.get('buffer'),lunchBreak:f.has('lunchBreak'),skipWeekends:f.has('skipWeekends')};if(settings.startHour>=settings.endHour){toast('结束时刻必须晚于开始时刻。');return;}if(change(next=>{next.settings=settings;})){proposals=[];toast('可用时间已保存');}};
-  if($('#backup-file'))$('#backup-file').onchange=async e=>{try{const file=e.target.files[0];if(!file)return;if(file.size>10*1024*1024)throw new Error('备份文件不能超过 10 MB');const next=validateBackup(JSON.parse(await file.text()));if(!confirm(`恢复 ${next.events.length} 条日程和 ${next.tasks.length} 个任务？这会替换当前数据，建议先导出备份。`))return;const oldError=loadError;loadError='';if(commit(next)){proposals=[];semesterPreview=null;newSemesterId=uid();render();toast('备份已恢复');}else loadError=oldError;}catch(error){toast('恢复失败：'+error.message);}};
+  if($('#backup-file'))$('#backup-file').onchange=async e=>{try{const file=e.target.files[0];if(!file)return;if(file.size>10*1024*1024)throw new Error('备份文件不能超过 10 MB');const next=syncSemesterData(validateBackup(JSON.parse(await file.text())));if(!confirm(`恢复 ${next.events.length} 条日程和 ${next.tasks.length} 个任务？这会替换当前数据，建议先导出备份。`))return;const oldError=loadError;loadError='';if(commit(next)){proposals=[];semesterPreview=null;newSemesterId=uid();render();toast('备份已恢复');}else loadError=oldError;}catch(error){toast('恢复失败：'+error.message);}};
 }
 const actions={
+  'semester-calendar':()=>openSemesterCalendar(),
   'new-event':()=>editEvent(), 'new-task':()=>editTask(),
   today:()=>{selected=dayKey(new Date());month=new Date(new Date().getFullYear(),new Date().getMonth(),1);render();},
   parse:()=>{if(!referenceDay){toast('请选择参考日期');return;} drafts=parseSchedule(ocrText,referenceDay);render();toast(drafts.length?`已生成 ${drafts.length} 条草稿，请核对`:'未找到有效时间，请使用 09:00 或 下午2点 格式。');},
@@ -242,7 +275,7 @@ function editEvent(existing,preset={}) {
   if(existing)$('#delete-event').onclick=()=>{
     const button=$('#delete-event');
     if(button.dataset.confirm!=='yes'){button.dataset.confirm='yes';button.textContent='确认删除';$('#editor-error').textContent='再次点“确认删除”移除这条日程；删除后可撤销。';return;}
-    if(change(next=>{next.events=next.events.filter(e=>e.id!==existing.id);})){ $('#editor').close();toast('日程已删除',()=>{if(!data.events.some(e=>e.id===existing.id)&&change(next=>next.events.push(existing)))toast('已撤销删除');});}
+    if(change(next=>{next.events=next.events.filter(e=>e.id!==existing.id);if(existing.semesterId===next.semester?.id)next.semester.excludedOccurrences=[...new Set([...(next.semester.excludedOccurrences||[]),existing.id])];})){ $('#editor').close();toast('日程已删除',()=>{if(!data.events.some(e=>e.id===existing.id)&&change(next=>{next.events.push(existing);if(next.semester)next.semester.excludedOccurrences=(next.semester.excludedOccurrences||[]).filter(id=>id!==existing.id);}))toast('已撤销删除');});}
   };
   $('#event-form').onsubmit=e=>{e.preventDefault();const f=new FormData(e.target);if(!f.get('start')||!f.get('end'))return;const nextEvent={...event,title:String(f.get('title')).trim(),start:new Date(f.get('start')).toISOString(),end:new Date(f.get('end')).toISOString(),category:f.get('category'),notes:String(f.get('notes'))};if(!validEvent(nextEvent)){$('#editor-error').textContent='请填写标题，结束时间必须晚于开始时间。';return;}const events=Array.from({length:Number(f.get('repeat')||1)},(_,i)=>({...nextEvent,id:i===0?event.id:uid(),start:addDays(nextEvent.start,i*7).toISOString(),end:addDays(nextEvent.end,i*7).toISOString()}));if(events.some((ev,i)=>[...data.events.filter(other=>other.id!==event.id),...events.slice(0,i)].some(other=>overlap(ev,other)))&&!confirm('日程存在时间重叠，仍然保存吗？'))return;if(change(next=>{next.events=next.events.filter(ev=>ev.id!==event.id);next.events.push(...events);})){ $('#editor').close();toast('日程已保存'); }};
 }
@@ -267,7 +300,8 @@ async function recognize(file){
     if(!ocrText)toast('没有识别到文字，请换一张清晰的图片或手动输入。');else toast('文字已识别，可修改后解析成草稿。');
   }catch(error){busy=false;render();toast('识别失败：'+error.message);}finally{if(worker)await worker.terminate();}
 }
-window.addEventListener('storage',event=>{if(event.key!==KEY)return;try{data=event.newValue?validateBackup(JSON.parse(event.newValue)):blank();rawBackup=event.newValue||'';loadError='';semesterPreview=null;render();toast('已同步此浏览器其他窗口的变更。');}catch{loadError='其他窗口的数据无效，已暂停写入。';render();}});
+window.addEventListener('storage',event=>{if(event.key!==KEY)return;try{data=event.newValue?syncSemesterData(validateBackup(JSON.parse(event.newValue))):blank();rawBackup=event.newValue||'';loadError='';semesterPreview=null;render();toast('已同步此浏览器其他窗口的变更。');}catch{loadError='其他窗口的数据无效，已暂停写入。';render();}});
 render();
+refreshOfficialCalendars();
 if('serviceWorker' in navigator)navigator.serviceWorker.register('./sw.js').catch(()=>{console.info('离线缓存未启用，联网功能仍可使用。');});
 

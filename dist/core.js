@@ -57,6 +57,7 @@ const validClock = clock => typeof clock==='string' && /^(?:[01]\d|2[0-3]):[0-5]
 export function validateSemester(s) {
   if (!s || typeof s.id!=='string' || !s.id || typeof s.name!=='string' || s.name.length>100 || !validDay(s.start) || +s.start.slice(0,4)<1900 || +s.start.slice(0,4)>2199 || !Number.isInteger(s.weeks) || s.weeks<1 || s.weeks>52 || !Array.isArray(s.templates) || s.templates.length>100) throw new Error('请填写有效的开始日期和 1–52 周的学期长度，固定课程最多 100 条。');
   if (!s.templates.every(t=>t && typeof t.id==='string' && t.id && typeof t.title==='string' && t.title.trim() && t.title.length<=500 && Number.isInteger(t.weekday) && t.weekday>=1 && t.weekday<=7 && validClock(t.start) && (validClock(t.end)||t.end==='24:00') && t.end>t.start && Object.hasOwn(categories,t.category) && typeof t.notes==='string' && t.notes.length<=5000) || new Set(s.templates.map(t=>t.id)).size!==s.templates.length) throw new Error('固定课程需要有效的星期、标题和当天起止时间；跨午夜课程请拆成两条。');
+  if(s.excludedOccurrences!==undefined && (!Array.isArray(s.excludedOccurrences)||s.excludedOccurrences.length>10000||!s.excludedOccurrences.every(id=>typeof id==='string'&&id.startsWith(`semester:${s.id}:`))||new Set(s.excludedOccurrences).size!==s.excludedOccurrences.length))throw new Error('学期单次课程删除记录无效。');
   return s;
 }
 export const semesterEnd = s => dayKey(addDays(dateAt(s.start),s.weeks*7-1));
@@ -64,10 +65,10 @@ export const semesterYears = s => Array.from({length:+semesterEnd(s).slice(0,4)-
 export function validateHolidayCalendar(c,year) {
   const official = url => { try { const u=new URL(url); return u.protocol==='https:' && (u.hostname==='gov.cn'||u.hostname.endsWith('.gov.cn')); } catch { return false; } };
   if (!c || !Number.isInteger(year) || year<1900 || year>2200 || c.year!==year || !Array.isArray(c.papers) || !c.papers.length || c.papers.length>50 || !c.papers.every(official) || !Array.isArray(c.days) || !c.days.length || c.days.length>366 || !c.days.every(d=>d && validDay(d.date) && +d.date.slice(0,4)===year && typeof d.name==='string' && d.name.trim() && d.name.length<=100 && typeof d.isOffDay==='boolean') || !c.days.some(d=>d.isOffDay) || new Set(c.days.map(d=>d.date)).size!==c.days.length) throw new Error(`${year} 年假期数据无效，未用于排课。`);
-  return {year,papers:[...c.papers],days:c.days.map(({date,name,isOffDay})=>({date,name,isOffDay}))};
+  return {year,papers:[...c.papers],days:c.days.map(({date,name,isOffDay})=>({date,name,isOffDay})),...(['official-notice','community'].includes(c.source)?{source:c.source}:{}),...(typeof c.fetchedAt==='string'&&Number.isFinite(+new Date(c.fetchedAt))?{fetchedAt:c.fetchedAt}:{})};
 }
 // Offline fallback transcribed from the State Council's published annual notices.
-const holidayRanges = (year,paper,ranges) => ({year,papers:[paper],days:ranges.flatMap(([name,start,end])=>{
+const holidayRanges = (year,paper,ranges) => ({year,papers:[paper],source:'official-notice',days:ranges.flatMap(([name,start,end])=>{
   const days=[];for(let d=dateAt(`${year}-${start}`);dayKey(d)<=`${year}-${end}`;d=addDays(d,1))days.push({date:dayKey(d),name,isOffDay:true});return days;
 })});
 export const bundledHolidays = [
@@ -82,29 +83,80 @@ export function holidayMap(calendars=bundledHolidays) {
 export async function fetchHolidayYear(year,fetcher=globalThis.fetch) {
   const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),10000);
   try {
+    // Same-origin data is collected from government notices during publication.
+    try {
+      const official=await fetcher('./official-holidays.json',{signal:controller.signal,cache:'no-store'});
+      if(official.ok){const body=await official.json();if(body.version===1&&Array.isArray(body.calendars)){const calendar=body.calendars.find(c=>c.year===year&&c.source==='official-notice');if(calendar)return validateHolidayCalendar(calendar,year);}}
+    } catch(error) { if(controller.signal.aborted)throw error; }
     const response=await fetcher(`https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/${year}.json`,{signal:controller.signal,cache:'no-store'});
     if(!response.ok)throw new Error(`${year} 年假期尚未获取（HTTP ${response.status}），请在公布后重试。`);
-    return validateHolidayCalendar(await response.json(),year);
+    return {...validateHolidayCalendar(await response.json(),year),source:'community'};
   } catch(error) {
     if(error.name==='AbortError')throw new Error(`${year} 年假期获取超时，请检查网络后重试。`);
     if(error instanceof TypeError)throw new Error(`${year} 年假期无法联网获取，请检查网络后重试。`);
     throw error;
   } finally { clearTimeout(timeout); }
 }
-export function generateSemester(s,calendars) {
+export function generateSemester(s,calendars,{allowMissing=false}={}) {
   validateSemester(s);
   const valid=calendars.map(c=>validateHolidayCalendar(c,c.year));
   const missing=semesterYears(s).filter(year=>!valid.some(c=>c.year===year));
-  if(missing.length)throw new Error(`缺少 ${missing.join('、')} 年假期数据。请联网更新国家假期；未获取到的年份暂不生成课程，已保存的固定课表仍可编辑。`);
+  if(missing.length&&!allowMissing)throw new Error(`缺少 ${missing.join('、')} 年假期数据。`);
   const holidays=holidayMap(valid),events=[],skipped=[];
   for(let i=0;i<s.weeks*7;i++){
     const date=addDays(dateAt(s.start),i),day=dayKey(date),weekday=(date.getDay()+6)%7+1;
     for(const t of s.templates.filter(t=>t.weekday===weekday)) {
       if(holidays.has(day)){skipped.push({day,title:t.title,holiday:holidays.get(day)});continue;}
-      events.push({id:`semester:${s.id}:${t.id}:${day}`,semesterId:s.id,templateId:t.id,occurrenceDay:day,title:t.title,start:dateAt(day,t.start).toISOString(),end:dateAt(day,t.end).toISOString(),category:t.category,notes:t.notes});
+      events.push({id:`semester:${s.id}:${t.id}:${day}`,semesterId:s.id,templateId:t.id,occurrenceDay:day,title:t.title,start:dateAt(day,t.start).toISOString(),end:dateAt(day,t.end).toISOString(),category:t.category,notes:t.notes,...(missing.includes(date.getFullYear())?{holidayPending:true}:{})});
     }
   }
-  return {events,skipped};
+  return {events,skipped,missingYears:missing};
+}
+const occurrenceFields=['title','start','end','category','notes'];
+const occurrenceOrigin = e => Object.fromEntries(occurrenceFields.map(key=>[key,e[key]]));
+export function semesterCalendars(data) {
+  return [...bundledHolidays.filter(c=>!(data.holidayCalendars||[]).some(saved=>saved.year===c.year)),...(data.holidayCalendars||[])];
+}
+// Keep the calendar and planner in sync, while preserving single-instance edits/deletions.
+export function syncSemesterData(input,previous=input) {
+  if(!input.semester)return input;
+  const next=structuredClone(input),s=next.semester,result=generateSemester(s,semesterCalendars(next),{allowMissing:true});
+  const existing=new Map(next.events.filter(e=>e.semesterId===s.id).map(e=>[e.id,e])),excluded=new Set(s.excludedOccurrences||[]);
+  const prior=previous.semester?.id===s.id?previous.semester:s;
+  const generated=result.events.filter(e=>!excluded.has(e.id)).map(e=>{
+    const old=existing.get(e.id),template=prior.templates.find(t=>t.id===e.templateId);
+    const oldOrigin=old?.semesterOrigin||(template?{title:template.title,start:dateAt(e.occurrenceDay,template.start).toISOString(),end:dateAt(e.occurrenceDay,template.end).toISOString(),category:template.category,notes:template.notes}:null);
+    const origin=occurrenceOrigin(e),updated={...e,semesterOrigin:origin};
+    if(old&&oldOrigin)for(const key of occurrenceFields)if(old[key]!==oldOrigin[key])updated[key]=old[key];
+    return updated;
+  });
+  next.events=replaceSemesterEvents(next.events,s,generated);
+  return validateBackup(next);
+}
+export const officialNoticeSources = {
+  2025:['https://www.gov.cn/zhengce/content/202411/content_6986382.htm'],
+  2026:['https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm','https://www.beijing.gov.cn/zhengce/zhengcefagui/202511/t20251104_4258873.html']
+};
+export function parseOfficialNotice(html,year,url) {
+  // Parsing is performed in Node during publication; HTML is never executed.
+  const traditional={'國':'国','務':'务','辦':'办','廳':'厅','關':'关','於':'于','節':'节','勞':'劳','動':'动','慶':'庆','調':'调','休':'休','佈':'布','經':'经','準':'准','計':'计'};
+  const text=String(html).replace(/<!--[^]*?-->/g,' ').replace(/<(script|style)\b[^>]*>[^]*?<\/\1>/gi,' ').replace(/<[^>]*>/g,' ').replace(/&#(?:x([\da-f]+)|(\d+));/gi,(_,hex,decimal)=>{const code=parseInt(hex||decimal,hex?16:10);return code<=0x10ffff?String.fromCodePoint(code):' ';}).replace(/&(?:nbsp|ensp|emsp);/g,' ').normalize('NFKC').replace(/[國務辦廳關於節勞動慶調休佈經準計]/g,c=>traditional[c]).replace(/\s+/g,' ');
+  if(!text.includes(`国务院办公厅关于${year}年部分节假日安排的通知`) && !text.replace(/\s/g,'').includes(`国务院办公厅关于${year}年部分节假日安排的通知`))throw new Error(`${year} 年官方通知标题不匹配。`);
+  const records=[],names=new Set();
+  for(const match of text.matchAll(/(元旦|春节|清明节|劳动节|端午节|中秋节|国庆节(?:、中秋节)?)\s*[:：]\s*([^。]+)/g)){
+    const name=match[1],sentence=match[2].replace(/[（(][^）)]*[）)]/g,'');
+    if(!/放假/.test(sentence))continue;
+    const range=sentence.match(/(\d{1,2})月(\d{1,2})日\s*(?:(?:至|—|-)\s*(?:(\d{1,2})月)?(\d{1,2})日)?/);
+    if(!range)throw new Error(`${name} 日期无法解析。`);
+    const date=(m,d)=>`${year}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`,start=date(+range[1],+range[2]),end=date(+(range[3]||range[1]),+(range[4]||range[2]));
+    if(!validDay(start)||!validDay(end)||end<start)throw new Error(`${name} 日期无效。`);
+    const days=Math.round((dateAt(end)-dateAt(start))/86400000)+1,count=sentence.match(/(?:共|放假)\s*(\d+)天/);
+    if(days<1||days>10||!count||+count[1]!==days)throw new Error(`${name} 放假天数不匹配。`);
+    if(names.has(name))continue;
+    names.add(name);for(let day=dateAt(start);dayKey(day)<=end;day=addDays(day,1))records.push({date:dayKey(day),name,isOffDay:true});
+  }
+  if(names.size<6||!['元旦','春节','清明节','劳动节','端午节'].every(n=>names.has(n))||![...names].some(n=>n.startsWith('国庆节'))||![...names].some(n=>n.includes('中秋节')))throw new Error(`${year} 年官方通知不完整。`);
+  return validateHolidayCalendar({year,papers:[url],days:records,source:'official-notice',fetchedAt:new Date().toISOString()},year);
 }
 export function replaceSemesterEvents(existing,s,generated) {
   const retained=existing.filter(e=>e.semesterId!==s.id),events=[...retained,...generated];
